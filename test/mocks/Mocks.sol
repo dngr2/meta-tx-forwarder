@@ -37,6 +37,41 @@ contract GasBurner {
     }
 }
 
+/// @dev A refund receiver that, on being refunded during `batchExecute`, re-enters the forwarder and
+///      tries to pull out its balance with a zero-`msg.value` call. The mismatched-value guard must
+///      reject the nested call, so no double-refund / drain of any (even forced) forwarder balance is
+///      possible. Reentry outcome is captured for assertions.
+contract ReentrantRefundReceiver {
+    Forwarder public immutable forwarder;
+    Forwarder.ForwardRequest internal stored;
+    bytes internal storedSig;
+    bool public reentryReverted;
+    bool public entered;
+    uint256 public forwarderBalanceSeen;
+
+    constructor(Forwarder forwarder_) {
+        forwarder = forwarder_;
+    }
+
+    function arm(Forwarder.ForwardRequest calldata req, bytes calldata sig) external {
+        stored = req;
+        storedSig = sig;
+    }
+
+    receive() external payable {
+        if (entered) return;
+        entered = true;
+        forwarderBalanceSeen = address(forwarder).balance;
+        // Try to make the forwarder send its (possibly forced) balance out without paying for it.
+        Forwarder.ForwardRequest memory r = stored;
+        try forwarder.execute{value: 0}(r, storedSig) {
+            reentryReverted = false;
+        } catch {
+            reentryReverted = true;
+        }
+    }
+}
+
 /// @dev Recipient that re-enters the forwarder trying to replay the same request.
 contract ReentrantRecipient {
     Forwarder public immutable forwarder;

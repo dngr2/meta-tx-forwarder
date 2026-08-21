@@ -112,6 +112,38 @@ contract Handler is Test {
         }
     }
 
+    /// @dev A non-atomic batch mixing one always-valid request with one always-invalid (expired) one.
+    ///      The invalid request is skipped and its value refunded to a sink; only the valid one's value
+    ///      reaches the recipient. Exercises the skip/refund value path under fail-on-revert without
+    ///      ever reverting (a non-atomic skip does not revert).
+    function batchWithRefund(uint256 actorSeed, uint256 valueSeed) external {
+        if (block.timestamp == 0) vm.warp(1); // ensure an expired deadline is representable
+        uint256 idx = bound(actorSeed, 0, N - 1);
+        uint256 badIdx = (idx + 1) % N;
+        uint256 goodValue = bound(valueSeed, 0, 3 ether);
+        uint256 badValue = bound(uint256(keccak256(abi.encode(valueSeed))), 0, 3 ether);
+
+        Forwarder.ForwardRequest[] memory reqs = new Forwarder.ForwardRequest[](2);
+        bytes[] memory sigs = new bytes[](2);
+
+        reqs[0] = _build(idx, goodValue, abi.encodeCall(SampleRecipient.ping, ("refund")));
+        sigs[0] = _sign(keys[idx], reqs[0]);
+
+        // Expired => always skipped & refunded (never touches nonces or the recipient).
+        reqs[1] = _build(badIdx, badValue, abi.encodeCall(SampleRecipient.ping, ("skip")));
+        reqs[1].deadline = uint48(block.timestamp - 1);
+        sigs[1] = _sign(keys[badIdx], reqs[1]);
+
+        uint256 total = goodValue + badValue;
+        vm.deal(address(this), total);
+        forwarder.batchExecute{value: total}(reqs, sigs, payable(address(0xCAFE)));
+
+        // Only the valid request executed; the expired one's value was refunded to the sink.
+        ghostNonce[reqs[0].from] += 1;
+        totalExecuted += 1;
+        totalValueDelivered += goodValue;
+    }
+
     function signerAt(uint256 i) external view returns (address) {
         return signers[i % N];
     }
@@ -134,12 +166,14 @@ contract ForwarderInvariantTest is Test {
     }
 
     /// @dev The forwarder must never retain native token.
+    /// forge-config: default.invariant.fail-on-revert = true
     function invariant_forwarderHoldsNoEth() public view {
         assertEq(address(forwarder).balance, 0);
     }
 
     /// @dev On-chain nonce for every signer equals the ghost count of its executed requests.
     ///      This simultaneously proves nonces never decrease and that no request executed twice.
+    /// forge-config: default.invariant.fail-on-revert = true
     function invariant_noncesMatchGhost() public view {
         for (uint256 i; i < handler.signerCount(); ++i) {
             address s = handler.signerAt(i);
@@ -149,6 +183,7 @@ contract ForwarderInvariantTest is Test {
 
     /// @dev The sum of all on-chain nonces equals the total number of executed requests. A double
     ///      execution or a skipped nonce would break this pinned identity.
+    /// forge-config: default.invariant.fail-on-revert = true
     function invariant_totalExecutionsPinned() public view {
         uint256 sum;
         for (uint256 i; i < handler.signerCount(); ++i) {
@@ -158,6 +193,7 @@ contract ForwarderInvariantTest is Test {
     }
 
     /// @dev All delivered value ended up at the recipient, never stranded in the forwarder.
+    /// forge-config: default.invariant.fail-on-revert = true
     function invariant_valueConserved() public view {
         assertEq(address(recipient).balance, handler.totalValueDelivered());
         assertEq(address(forwarder).balance, 0);

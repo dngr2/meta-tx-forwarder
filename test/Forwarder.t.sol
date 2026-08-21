@@ -4,7 +4,7 @@ pragma solidity 0.8.26;
 import {Test} from "forge-std/Test.sol";
 import {Forwarder} from "../src/Forwarder.sol";
 import {SampleRecipient} from "../src/SampleRecipient.sol";
-import {ERC1271Wallet, GasBurner, ReentrantRecipient} from "./mocks/Mocks.sol";
+import {ERC1271Wallet, GasBurner, ReentrantRecipient, ReentrantRefundReceiver} from "./mocks/Mocks.sol";
 
 contract ForwarderTest is Test {
     Forwarder internal forwarder;
@@ -467,5 +467,114 @@ contract ForwarderTest is Test {
         sigs[0] = _sign(aliceKey, reqs[0]);
         vm.expectRevert(Forwarder.MismatchedArrayLengths.selector);
         forwarder.batchExecute(reqs, sigs, payable(makeAddr("refund")));
+    }
+
+    // --------------------------------------------------------------------- //
+    //                        Deep dive (v2) adversarial                     //
+    // --------------------------------------------------------------------- //
+
+    /// @dev secp256k1 order; s must be in the lower half or OZ ECDSA rejects the signature.
+    uint256 internal constant SECP256K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141;
+
+    /// A malleable variant (s' = n - s, v flipped) of a valid signature must be rejected. OZ's ECDSA
+    /// enforces low-s, so the classic ECDSA malleability cannot be used to forge a second acceptance.
+    function test_MalleableSignatureRejected() public {
+        Forwarder.ForwardRequest memory req = _req(alice, address(recipient), 0, _pingData());
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(aliceKey, forwarder.hashRequest(req));
+        uint8 flippedV = v == 27 ? 28 : 27;
+        bytes32 malS = bytes32(SECP256K1_N - uint256(s));
+        bytes memory malleable = abi.encodePacked(r, malS, flippedV);
+
+        assertFalse(forwarder.verify(req, malleable), "high-s malleable sig must not verify");
+        vm.expectRevert(abi.encodeWithSelector(Forwarder.InvalidSigner.selector, alice));
+        forwarder.execute(req, malleable);
+    }
+
+    /// An EOA `to` with value is a plain ETH-transfer meta-tx: the call "succeeds" (no code), value is
+    /// delivered to the EOA, and the forwarder retains nothing.
+    function test_EoaTargetDeliversValue() public {
+        address payable eoa = payable(makeAddr("eoaTarget"));
+        uint256 amount = 1 ether;
+        vm.deal(relayer, amount);
+        Forwarder.ForwardRequest memory req = _req(alice, eoa, amount, "");
+        bytes memory sig = _sign(aliceKey, req);
+
+        vm.prank(relayer);
+        forwarder.execute{value: amount}(req, sig);
+
+        assertEq(eoa.balance, amount, "value delivered to EOA");
+        assertEq(address(forwarder).balance, 0, "no eth retained");
+        assertEq(forwarder.nonces(alice), 1);
+    }
+
+    /// The same request appearing twice in one non-atomic batch: the first consumes the nonce, the
+    /// second fails the nonce check and is skipped+refunded. No double execution, value conserved.
+    function test_DuplicateRequestInBatchExecutesOnce() public {
+        address refund = makeAddr("dupRefund");
+        vm.deal(relayer, 2 ether);
+
+        Forwarder.ForwardRequest memory req = _req(alice, address(recipient), 1 ether, _pingData());
+        bytes memory sig = _sign(aliceKey, req);
+
+        Forwarder.ForwardRequest[] memory reqs = new Forwarder.ForwardRequest[](2);
+        bytes[] memory sigs = new bytes[](2);
+        reqs[0] = req;
+        sigs[0] = sig;
+        reqs[1] = req; // identical duplicate
+        sigs[1] = sig;
+
+        vm.prank(relayer);
+        forwarder.batchExecute{value: 2 ether}(reqs, sigs, payable(refund));
+
+        assertEq(forwarder.nonces(alice), 1, "executed exactly once");
+        assertEq(recipient.pingCount(), 1, "recipient called exactly once");
+        assertEq(address(recipient).balance, 1 ether, "one value delivered");
+        assertEq(refund.balance, 1 ether, "duplicate's value refunded");
+        assertEq(address(forwarder).balance, 0, "no eth retained");
+    }
+
+    /// A reentrant refund receiver cannot double-refund nor drain a *forced* forwarder balance: its
+    /// nested zero-value execute is rejected by the value guard, and the stranded forced ETH is
+    /// untouched. Proves the forwarder never pays out more than each caller funds.
+    function test_ReentrantRefundReceiverCannotDrain() public {
+        ReentrantRefundReceiver evil = new ReentrantRefundReceiver(forwarder);
+
+        // Force an unaccounted 5 ether into the forwarder (as a selfdestruct/coinbase push would).
+        vm.deal(address(forwarder), 5 ether);
+
+        // An invalid (wrong-signer) request carrying 1 ether that will be skipped and refunded to evil.
+        Forwarder.ForwardRequest memory bad = _req(bob, address(recipient), 1 ether, _pingData());
+        bytes memory badSig = _sign(aliceKey, bad); // wrong signer => skipped
+
+        // Arm evil with a *valid-looking* request of value 1 ether that it will try to run with value 0.
+        Forwarder.ForwardRequest memory armed = _req(alice, address(recipient), 1 ether, _pingData());
+        evil.arm(armed, _sign(aliceKey, armed));
+
+        Forwarder.ForwardRequest[] memory reqs = new Forwarder.ForwardRequest[](1);
+        bytes[] memory sigs = new bytes[](1);
+        reqs[0] = bad;
+        sigs[0] = badSig;
+
+        vm.deal(relayer, 1 ether);
+        vm.prank(relayer);
+        forwarder.batchExecute{value: 1 ether}(reqs, sigs, payable(address(evil)));
+
+        assertTrue(evil.entered(), "refund receiver re-entered");
+        assertTrue(evil.reentryReverted(), "nested zero-value execute must revert on value guard");
+        assertEq(address(evil).balance, 1 ether, "receiver got exactly its single refund");
+        assertEq(address(forwarder).balance, 5 ether, "forced balance stranded, never drained");
+        assertEq(forwarder.nonces(alice), 0, "armed request never executed via reentrancy");
+    }
+
+    /// A request whose `to` is the forwarder itself cannot spoof a sender: the forwarder is not an
+    /// ERC-2771 recipient, so the appended `from` is inert. The self-call just runs `nonces(alice)`.
+    function test_SelfCallCannotSpoofSender() public {
+        bytes memory innerData = abi.encodeCall(Forwarder.nonces, (alice));
+        Forwarder.ForwardRequest memory req = _req(alice, address(forwarder), 0, innerData);
+        bytes memory sig = _sign(aliceKey, req);
+
+        forwarder.execute(req, sig); // must not revert; appended-from is ignored by the forwarder
+        assertEq(forwarder.nonces(alice), 1, "nonce advanced once; no reentrant replay");
+        assertEq(address(forwarder).balance, 0);
     }
 }

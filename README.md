@@ -5,8 +5,8 @@ transact without holding native gas token; recipient contracts recover the real 
 ERC-2771 context.
 
 - Solidity `0.8.26`, `via_ir`, EVM `cancun`, OpenZeppelin Contracts `v5.0.2` (vendored).
-- 41 tests (37 unit + 4 stateful invariants), all green. Invariants proven non-hollow at
-  **12,800 calls / 0 reverts** under `FOUNDRY_INVARIANT_FAIL_ON_REVERT=true`.
+- 46 tests (42 unit + 4 stateful invariants), all green. Invariants proven non-hollow at
+  **12,800 calls / 0 reverts** with `fail-on-revert = true` pinned inline.
 
 ## The ERC-2771 model
 
@@ -89,6 +89,30 @@ requires `msg.value == sum(req.value)` and refunds the value of any skipped or r
   reverts the whole batch. Either way `msg.value` must equal the sum of request values and no ETH is
   retained.
 
+## Deep dive (v2)
+
+A second adversarial pass hunted specifically for replay, sender-spoofing, and ETH-retention bugs.
+**No exploitable bug was found — the forwarder holds.** The audit confirmed:
+
+- **Replay / reentrancy.** The nonce is consumed before the external call (CEI); a reentrant
+  recipient replaying the same request hits the nonce guard. A duplicate request inside one
+  non-atomic batch executes exactly once (second copy skipped + refunded).
+- **Sender-spoofing.** The signature binds `from`/`to`/`data`, so a relayer cannot forge a victim's
+  request. A request whose `to` is the forwarder itself cannot spoof a sender — the forwarder is not
+  an ERC-2771 recipient, so the appended `from` is inert.
+- **Signature malleability.** OZ's `ECDSA` enforces low-`s`; the malleable counterpart
+  (`s' = n - s`, `v` flipped) of a valid signature is rejected.
+- **ETH retention / drain.** `msg.value == Σ request values` is enforced and every skipped/reverted
+  request's value is refunded, so the forwarder retains nothing in normal operation. A reentrant
+  `refundReceiver` cannot double-refund nor drain a *forced* (selfdestruct-pushed) balance: its
+  nested `execute` is rejected by the value guard because each call can only move `msg.value` it
+  itself funds. Forced ETH is stranded but never stealable.
+
+New adversarial tests: `test_MalleableSignatureRejected`, `test_EoaTargetDeliversValue`,
+`test_DuplicateRequestInBatchExecutesOnce`, `test_ReentrantRefundReceiverCannotDrain`,
+`test_SelfCallCannotSpoofSender`, plus a `batchWithRefund` invariant action that drives the
+skip/refund value path under `fail-on-revert = true`.
+
 ## Layout
 
 | path | purpose |
@@ -96,7 +120,7 @@ requires `msg.value == sum(req.value)` and refunds the value of any skipped or r
 | `src/Forwarder.sol` | EIP-712 forwarder: `execute`, `batchExecute`, `verify`, `nonces` |
 | `src/ERC2771Context.sol` | minimal ERC-2771 context (trusted-forwarder sender recovery) |
 | `src/SampleRecipient.sol` | recipient that records `_msgSender()` to prove real-sender delivery |
-| `test/Forwarder.t.sol` | 37 unit tests (signatures, nonces, ERC-1271, value, gas, batch) |
+| `test/Forwarder.t.sol` | 42 unit tests (signatures, nonces, ERC-1271, value, gas, batch, v2 adversarial) |
 | `test/ForwarderInvariant.t.sol` | stateful invariants driven by real signatures |
 | `script/Deploy.s.sol` | deploys the forwarder + a wired sample recipient |
 
@@ -104,7 +128,7 @@ requires `msg.value == sum(req.value)` and refunds the value of any skipped or r
 
 ```bash
 forge build --sizes          # Forwarder runtime ~3.9 KB, well under EIP-170
-forge test                   # 41 passing
+forge test                   # 46 passing
 forge fmt --check
-FOUNDRY_INVARIANT_FAIL_ON_REVERT=true forge test --match-path test/ForwarderInvariant.t.sol
+forge test --match-path test/ForwarderInvariant.t.sol   # fail-on-revert pinned inline
 ```
